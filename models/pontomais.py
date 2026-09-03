@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from os import getenv
 from pathlib import Path
 import re
 import shutil
 import tempfile
+from threading import Event, Thread
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -36,6 +38,31 @@ class PontoMaisReports:
         self.import_token = import_token
         self.progress = progress
 
+    @contextmanager
+    def _progressing(self, start, ceiling, step, interval_seconds=1):
+        self.progress(start, step)
+        stop, current, limit = Event(), start, max(start, ceiling - 1)
+
+        def heartbeat():
+            nonlocal current
+            while not stop.wait(interval_seconds):
+                if current < limit:
+                    current += 1
+                    self.progress(current, step)
+
+        worker = Thread(target=heartbeat, name="pontomais-progress", daemon=True)
+        worker.start()
+        try:
+            yield
+        except BaseException:
+            stop.set()
+            worker.join(timeout=1)
+            raise
+        else:
+            stop.set()
+            worker.join(timeout=1)
+            self.progress(ceiling, step)
+
     def _select_option(self, page, select, option):
         container = select.locator("xpath=ancestor::ng-select[1]")
         select.wait_for(state="visible", timeout=REQUEST_TIMEOUT_SECONDS * 1000)
@@ -59,47 +86,55 @@ class PontoMaisReports:
             context = browser.new_context(accept_downloads=True)
             page = context.new_page()
             try:
-                page.goto(PONTOMAIS_URL, wait_until="domcontentloaded")
+                with self._progressing(13, 23, "Carregando tela de login", 1):
+                    page.goto(PONTOMAIS_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(ACTION_DELAY_MS)
                 self.progress(24, "Autenticando no Ponto Mais")
-                page.wait_for_timeout(ACTION_DELAY_MS)
                 login_field = page.locator("input[data-testid='login-input']:visible").first
                 password_field = page.locator("input[type='password']:visible").first
-                login_field.wait_for(state="visible", timeout=REQUEST_TIMEOUT_SECONDS * 1000)
-                login_field.fill(login)
-                page.wait_for_timeout(ACTION_DELAY_MS)
-                password_field.fill(password)
-                page.wait_for_timeout(ACTION_DELAY_MS)
-                page.get_by_role("button", name="Entrar", exact=True).click()
-                page.wait_for_timeout(PAGE_TRANSITION_DELAY_MS)
+                with self._progressing(25, 33, "Preenchendo credenciais", 1.2):
+                    login_field.wait_for(state="visible", timeout=REQUEST_TIMEOUT_SECONDS * 1000)
+                    login_field.fill(login)
+                    page.wait_for_timeout(ACTION_DELAY_MS)
+                    password_field.fill(password)
+                    page.wait_for_timeout(ACTION_DELAY_MS)
+                    page.get_by_role("button", name="Entrar", exact=True).click()
+                with self._progressing(34, 41, "Validando acesso ao Ponto Mais", 1.6):
+                    page.wait_for_timeout(PAGE_TRANSITION_DELAY_MS)
                 if "/login" in page.url:
                     raise RuntimeError("O Ponto Mais permaneceu na tela de login; verifique as credenciais ou a validação da conta.")
-                page.goto(f"{PONTOMAIS_URL}/relatorios", wait_until="domcontentloaded")
-                page.wait_for_timeout(PAGE_TRANSITION_DELAY_MS)
-                self.progress(42, "Configurando Auditoria / Jornadas")
-                self._select_option(
-                    page,
-                    page.locator("ng-select").first.locator(".ng-input"),
-                    "Auditoria",
-                )
+                with self._progressing(42, 47, "Abrindo relatórios", 2.4):
+                    page.goto(f"{PONTOMAIS_URL}/relatorios", wait_until="domcontentloaded")
+                    page.wait_for_timeout(PAGE_TRANSITION_DELAY_MS)
+                with self._progressing(48, 53, "Selecionando Auditoria", 1.9):
+                    self._select_option(
+                        page,
+                        page.locator("ng-select").first.locator(".ng-input"),
+                        "Auditoria",
+                    )
+                self.progress(54, "Definindo período do relatório")
                 period = page.get_by_placeholder("Selecionar período")
                 period.fill(f"{date_label} - {date_label}")
                 period.press("Tab")
-                self._select_option(
-                    page,
-                    # Após escolher Auditoria, o quarto ng-select é o campo Modelo.
-                    # Os anteriores são Tipo, Agrupar por e Filtrar por. Usar sua posição
-                    # evita que um rótulo visual apontado pelo Angular selecione "Filtrar por".
-                    page.locator("ng-select").nth(3).locator(".ng-input"),
-                    "Jornadas",
-                )
-                self.progress(64, "Baixando relatório XLS")
-                page.get_by_role("button", name=re.compile("^Baixar", re.I)).click()
-                with page.expect_download(timeout=REQUEST_TIMEOUT_SECONDS * 1000) as pending:
-                    page.locator("#relatorios-baixar-xls").click(force=True)
+                with self._progressing(55, 63, "Selecionando modelo Jornadas", 1.1):
+                    self._select_option(
+                        page,
+                        # Após escolher Auditoria, o quarto ng-select é o campo Modelo.
+                        # Os anteriores são Tipo, Agrupar por e Filtrar por. Usar sua posição
+                        # evita que um rótulo visual apontado pelo Angular selecione "Filtrar por".
+                        page.locator("ng-select").nth(3).locator(".ng-input"),
+                        "Jornadas",
+                    )
+                with self._progressing(64, 67, "Preparando download XLS", 1):
+                    page.get_by_role("button", name=re.compile("^Baixar", re.I)).click()
+                with self._progressing(68, 80, "Baixando relatório XLS", 5):
+                    with page.expect_download(timeout=REQUEST_TIMEOUT_SECONDS * 1000) as pending:
+                        page.locator("#relatorios-baixar-xls").click(force=True)
                 with tempfile.TemporaryDirectory(prefix="tmhub-pontomais-") as directory:
                     report = Path(directory) / "jornadas.xlsx"
-                    pending.value.save_as(report)
-                    page.wait_for_timeout(5_000)
+                    with self._progressing(80, 81, "Finalizando download", 2):
+                        pending.value.save_as(report)
+                        page.wait_for_timeout(5_000)
                     if not report.is_file() or report.stat().st_size > MAX_REPORT_SIZE:
                         raise RuntimeError("O relatório baixado não é válido ou excede 30 MB.")
                     yield report
@@ -113,14 +148,15 @@ class PontoMaisReports:
             for report in self._download_jornadas(login, password):
                 self.progress(82, "Importando XLSX no TMHub")
                 with report.open("rb") as stream:
-                    response = requests.post(
-                        f"{api_url.rstrip('/')}/jornadas/importar",
-                        headers={"Access-Token": self.import_token},
-                        data={"data_referencia": self.reference_date.isoformat()},
-                        files={"file": ("jornadas.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                        timeout=REQUEST_TIMEOUT_SECONDS,
-                        allow_redirects=False,
-                    )
+                    with self._progressing(83, 98, "Importando XLSX no TMHub", 1.3):
+                        response = requests.post(
+                            f"{api_url.rstrip('/')}/jornadas/importar",
+                            headers={"Access-Token": self.import_token},
+                            data={"data_referencia": self.reference_date.isoformat()},
+                            files={"file": ("jornadas.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                            timeout=REQUEST_TIMEOUT_SECONDS,
+                            allow_redirects=False,
+                        )
                 if not response.ok:
                     diagnostics = Path.cwd() / "diagnosticos"
                     diagnostics.mkdir(exist_ok=True)
