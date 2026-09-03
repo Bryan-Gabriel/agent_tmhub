@@ -42,6 +42,8 @@ async def _run_pontomais_jornadas(command):
         except asyncio.TimeoutError:
             pass
     result = await task
+
+    await asyncio.sleep(0)
     while not updates.empty():
         progress, step = updates.get_nowait()
         await _emit_pontomais_progress(command, progress, step)
@@ -73,6 +75,7 @@ async def _handle_pontomais_report(command):
     try:
         await _emit_pontomais_progress(command, 5, "Preparando agente Ponto Mais")
         await _run_pontomais_jornadas(command)
+        await _emit_pontomais_progress(command, 100, "Importação concluída", status="completed")
         await sio.emit("command_done", {
             "command_id": command.get("command_id"),
             "agent_id": AGENT_ID,
