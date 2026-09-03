@@ -1,43 +1,116 @@
-from models.models import HK, VPN
+import asyncio
+from os import getenv
+
 from dotenv import load_dotenv
 from getmac import get_mac_address
-from os import getenv
 import socketio
-import asyncio
+
+from models.models import HK, VPN
+from models.pontomais import PontoMaisReports
+
 
 load_dotenv()
 API_URL = getenv("API_URL")
 AGENT_ID = get_mac_address()
 sio = socketio.AsyncClient()
 
-@sio.event
-async def connect(): print(f"Conectado! MAC: {AGENT_ID}"); await sio.emit("register", {"agent_id": AGENT_ID})
+
+async def _emit_pontomais_progress(command, progress, step, status="running"):
+    await sio.emit("command_progress", {
+        "command_id": command.get("command_id"),
+        "agent_id": AGENT_ID,
+        "progress": progress,
+        "step": step,
+        "status": status,
+    })
+
+
+async def _run_pontomais_jornadas(command):
+    """Executa a automação web sem bloquear o recebimento de comandos."""
+    loop = asyncio.get_running_loop()
+    updates = asyncio.Queue()
+
+    def report_progress(progress, step):
+        loop.call_soon_threadsafe(updates.put_nowait, (progress, step))
+
+    worker = PontoMaisReports(command["reference_date"], command["import_token"], report_progress)
+    task = asyncio.create_task(asyncio.to_thread(worker.run_jornadas, API_URL))
+    while not task.done():
+        try:
+            progress, step = await asyncio.wait_for(updates.get(), timeout=.4)
+            await _emit_pontomais_progress(command, progress, step)
+        except asyncio.TimeoutError:
+            pass
+    result = await task
+    while not updates.empty():
+        progress, step = updates.get_nowait()
+        await _emit_pontomais_progress(command, progress, step)
+    return result
+
 
 @sio.event
-async def disconnect(): print("Desconectado!")
+async def connect():
+    # agent_id é o contrato legado; os campos adicionais permitem que o
+    # RPA Center reconheça este mesmo agente como compatível com Ponto Mais.
+    await sio.emit("register", {
+        "agent_id": AGENT_ID,
+        "category": "Ponto Mais",
+        "capabilities": ["HK_adjust", "pontomais_report_import"],
+    })
+
+
+async def _handle_hk_adjust(command):
+    """Fluxo HK preservado como estava no agente original."""
+    adjusts = command.get("data", [])
+    hk = HK(command.get("isOpen", False))
+    hk.set_adjust(adjusts, open_tab_moviment=True)
+
+
+async def _handle_pontomais_report(command):
+    """Módulo novo, pronto para receber outros relatórios do Ponto Mais."""
+    if command.get("report") != "jornadas":
+        return
+    try:
+        await _emit_pontomais_progress(command, 5, "Preparando agente Ponto Mais")
+        await _run_pontomais_jornadas(command)
+        await sio.emit("command_done", {
+            "command_id": command.get("command_id"),
+            "agent_id": AGENT_ID,
+            "progress": 100,
+            "step": "Importação concluída",
+            "status": "completed",
+        })
+    except Exception as error:
+        await sio.emit("command_done", {
+            "command_id": command.get("command_id"),
+            "agent_id": AGENT_ID,
+            "progress": 0,
+            "step": str(error)[:180],
+            "status": "failed",
+        })
+
+
+# Novos módulos entram aqui sem alterar os existentes.
+COMMAND_HANDLERS = {
+    "HK_adjust": _handle_hk_adjust,
+    "pontomais_report_import": _handle_pontomais_report,
+}
+
 
 @sio.on("command")
 async def on_command(command):
-    if not isinstance(command, dict):
-        print(f"Formato inválido recebido: {type(command).__name__}")
-        return
+    if isinstance(command, dict) and (handler := COMMAND_HANDLERS.get(command.get("type"))):
+        await handler(command)
 
-    match command.get("type"):
-        case "HK_adjust":
-            adjusts = command.get("data", [])
-            hk = HK(command.get("isOpen", False))
-            hk.set_adjust(adjusts, open_tab_moviment=True)
-
-        case _: print(f"Tipo de comando desconhecido: {command.get('type')}")
 
 async def main():
-    print(f"Agente iniciado - MAC: {AGENT_ID}")
     while True:
         try:
             await sio.connect(API_URL)
             await sio.wait()
-        except Exception as e:
-            print(f"Conexão perdida: {e}, reconectando em 5s...")
+        except Exception:
             await asyncio.sleep(5)
 
-if __name__ == "__main__": asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
