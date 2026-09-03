@@ -1,0 +1,10 @@
+python-dotenv>=1.0,<2
+python-socketio[client]>=5.16,<6
+aiohttp>=3.13,<4
+getmac>=0.9,<1
+pyautogui>=0.9,<1
+opencv-python>=4.10,<5
+winotify>=1.1,<2
+termcolor>=2.5,<4
+playwright>=1.58,<2
+requests>=2.34,<3
